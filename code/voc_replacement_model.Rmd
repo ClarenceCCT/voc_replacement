@@ -1,0 +1,148 @@
+---
+title: "VOC replacement forecast model"
+output: 
+  html_notebook:
+    code_folding: hide
+---
+
+## Background
+ECDC uses a logistic growth model to estimate the time until an emergent SARS-CoV-2 variant becomes the dominant variant (>50%) in circulation (see https://www.ecdc.europa.eu/sites/default/files/documents/Epi-update-BQ1.pdf). The model is adapted from models developed by Althaus et al. 2021 (https://www.medrxiv.org/content/10.1101/2021.06.10.21258468v1.full.pdf) and Chen et al. 2021 (https://www.sciencedirect.com/science/article/pii/S1755436521000335?via%3Dihub). 
+
+The model estimates the daily proportion of cases due to the new variant as a function of two parameters: mu, the ratio of variant to other cases at time 0, and rho, the daily growth advantage of the new variant relative to existing variants. Here, mu is estimated from the proportion of sequenced isolates belonging to the new variant at time 0. rho is the growth in proportions relative to all other circulating lineages (estimates for Canada are from NLM, international estimates from CoV-Spectrum, https://cov-spectrum.org/explore/Europe/AllSamples/Past6M)
+
+[Assumptions, limitations]
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 9)
+```
+
+```{r}
+## load libraries
+library(tidyverse)
+library(here)
+```
+
+```{r}
+## define function to estimate daily proportion of variant
+estimate_pt <- function(t, mu, rho) {
+  
+  x <- 1 / (1 + mu * exp(1)^-(rho * t))
+  
+}
+
+```
+
+```{r}
+## define parameter values
+p_voi <- 0.01
+mu <- (1 - p_voi) / p_voi
+rho <- 0.11
+start_date <- as.Date("2022-10-08")
+```
+
+```{r}
+dat <- tibble(
+  t = c(0:120),
+  date = start_date + t,
+  pt = estimate_pt(t, mu, rho)
+)
+
+```
+
+```{r}
+## plot
+dat %>%
+  ggplot(aes(x = date, y = pt)) +
+  geom_line() +
+  scale_y_continuous(breaks = seq(0, 1, 0.2))
+```
+```{r}
+## model incorporating uncertainty in mu and rho parameters
+
+## function
+simulate_pt <- function(d, ...) {
+  
+  ## sample rho
+  rho <- rnorm(1, rho_mean, rho_sd)
+  
+  ## sample logit(p_voi)
+  logit_p <- rnorm(1, p_voi_mean, p_voi_sd)
+  p_voi <- boot::inv.logit(logit_p) # calculate initial proportion
+  mu <- (1 - p_voi) / p_voi
+  
+  ## calculate pt
+  d <- d %>%
+    mutate(
+      pt = 1 / (1 + mu * exp(1)^-(rho * d$t))
+    )
+  
+  d
+  #x <- rho * d$t
+  #return(x)
+  #print(rho)
+  #print(mu)
+  #print(x)
+}
+
+## rho is a random draw from ~N(rho_mean, rho_sd)
+rho_mean <- 0.11
+rho_sd <- 0.02
+
+## logit(p_voi) is a random draw from ~N(p_voi_mean, p_voi_sd)
+p_voi_mean <- -4.6
+p_voi_sd <- 1.5
+
+## number of random draws
+N <- 100
+
+## set time period in days
+t_end <- 120
+start_date <- as.Date("2022-10-08")
+
+## set random seed
+set.seed(20230330)
+
+```
+
+```{r}
+## create nested dataframe for simulation
+dat2 <- tibble(
+  t = rep(c(1:t_end), N),
+  run = rep(c(1:N), each = t_end)
+)
+
+dat2 <- dat2 %>%
+  group_by(run) %>%
+  group_modify(simulate_pt) %>%
+  ungroup()
+```
+
+```{r}
+dat2_summary <- dat2 %>%
+  group_by(t) %>%
+  summarise(
+    median = median(pt),
+    p5 = quantile(pt, probs = 0.05),
+    p95 = quantile(pt, probs = 0.95),
+    p25 = quantile(pt, probs = 0.25),
+    p75 = quantile(pt, probs = 0.75)
+  ) %>%
+  mutate(
+    date = start_date + t
+  )
+```
+
+```{r}
+## plot
+dat2_summary %>%
+  ggplot() + 
+  geom_ribbon(aes(x = date, ymin = p5, ymax = p95), fill = "gray80", alpha = 0.5) +
+  geom_ribbon(aes(x = date, ymin = p25, ymax = p75), fill = "gray50", alpha = 0.5) +
+  geom_line(aes(x = date, y = median), col = "black") +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), labels = scales::percent) + 
+  scale_x_date(date_labels = "%b-%y") +
+  labs(
+    y = "Percentage of variant"
+  )
+```
+
