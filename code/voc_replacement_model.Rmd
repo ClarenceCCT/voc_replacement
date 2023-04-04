@@ -1,6 +1,6 @@
 ---
 title: "VOC replacement forecast model"
-output: 
+output:
   html_notebook:
     code_folding: hide
 ---
@@ -142,7 +142,153 @@ dat2_summary %>%
   scale_y_continuous(breaks = seq(0, 1, 0.2), labels = scales::percent) + 
   scale_x_date(date_labels = "%b-%y") +
   labs(
-    y = "Percentage of variant"
+    y = "Percentage of variant",
+    x = "",
+    title = "Estimated daily percentage of BQ.1/BQ.1.1 cases among all SARS-CoV-2 cases in the EU/EEA"
   )
+```
+```{r}
+## NOTE: data from CoV-SPECTRUM are cumulative not week-specific
+## load XBB1.5 historical data from CoV-SPECTRUM
+# xbb <- read.csv(here("data", "cov-spectrum_xbb15.csv"), stringsAsFactors = FALSE)
+# xbb <- xbb %>%
+#   mutate(date = as.Date(date))
+
+## Download weekly XBB.1.5 proportions data from covariants.org (https://covariants.org/per-country)
+## data are available here: https://raw.githubusercontent.com/hodcroftlab/covariants/master/cluster_tables/EUClusters_data.json
+## note that these are based on Nextstrain clade assignment (23A Omicron)
+
+library(jsonlite)
+
+url <- "https://raw.githubusercontent.com/hodcroftlab/covariants/master/cluster_tables/EUClusters_data.json"
+json_data <- fromJSON(url, simplifyDataFrame = TRUE)
+us <- as_tibble(json_data$countries$US) %>% mutate(country = "United States") #%>% select(country, week, total_sequences, contains("23A"))
+ca <- as_tibble(json_data$countries$Canada) %>% mutate(country = "Canada") #%>% select(country, week, total_sequences, contains("23A"))
+sg <- as_tibble(json_data$countries$Singapore) %>% mutate(country = "Singapore") #%>% select(country, week, total_sequences, contains("23A"))
+fr <- as_tibble(json_data$countries$France) %>% mutate(country = "France") #%>% select(country, week, total_sequences, contains("23A"))
+de <- as_tibble(json_data$countries$Germany) %>% mutate(country = "Germany") #%>% select(country, week, total_sequences, contains("23A"))
+uk <- as_tibble(json_data$countries$`United Kingdom`) %>% mutate(country = "United Kingdom") #%>% select(country, week, total_sequences, contains("23A"))
+
+xbb <- bind_rows(us, ca, sg, fr, de, uk)
+
+xbb <- xbb %>%
+  select(country, week, total_sequences, contains("23A")) 
+
+names(xbb) <- c("country", "date", "total_sequences", "xbb_sequences")
+
+xbb <- xbb %>%
+  mutate(
+    xbb_prop = xbb_sequences / total_sequences,
+    date = as.Date(date)
+  )
+
+## calculate binomial 95% CIs
+conf_intervals <- as_tibble(Hmisc::binconf(xbb$xbb_sequences, xbb$total_sequences, alpha = 0.05))
+xbb <- bind_cols(xbb, conf_intervals %>% select(-PointEst))
+
+```
+
+```{r,fig.width = 12, fig.height = 6}
+## plot proportion XBB1.5 over time
+xbb %>%
+  ggplot(aes(x = date, y = xbb_prop, group = country, col = country)) +
+  geom_line() +
+  scale_x_date(date_labels = "%b-%y")
+```
+
+```{r}
+## run model with country-specific parameters based on proportion of XBB1.5 on a specific month
+start_month <- lubridate::ym("2022-12")
+
+## extract country-specific proportions on start date
+xbb <- xbb %>%
+  mutate(
+    ym = lubridate::ym(str_sub(as.character(date), 1, 7))
+  )
+         
+start_df <- xbb %>%
+  filter(ym == start_month) %>%
+  filter(date == min(date)) %>%
+  arrange(country)
+
+```
+
+```{r}
+countries <- start_df %>% select(country) %>% pull() # vector of country names
+start_props <- start_df %>% select(xbb_prop) %>% pull() # vector of country-specific variant proportions
+start_date <- min(start_df$date) # start date of analysis
+t_end <- 120 # length of estimation period in days
+rho <- 0.08 # assumed growth advantage for new variant at the start of the analysis period
+rho_min <- rho * 0.75 # if growth advantage is 25% lower or 50% higher
+rho_max <- rho * 1.25
+
+estimate_pt_country <- function(input_countries, p) {
+  
+  mu <- (1 - p) / p
+  
+  ## calculate date when proportion reaches 50%
+  t50 <- -1 * rho^-1 * (log(1-0.5) - log(mu * 0.5))
+  
+  d <- tibble(
+    country = rep(input_countries, t_end+1),
+    t = c(0:t_end),
+    date = start_date + t
+  )
+  
+  d <- d %>%
+    mutate(
+      pt = 1 / (1 + mu * exp(1)^-(rho * t)),
+      pt_min = 1 / (1 + mu * exp(1)^-(rho_min * t)),
+      pt_max = 1 / (1 + mu * exp(1)^-(rho_max * t)),
+      t50 = start_date + t50
+    )
+
+}
+
+country_list <- map2(countries, start_props, estimate_pt_country)
+xbb_predict <- country_list %>% bind_rows()
+
+## merge with observed data
+xbb_predict <- xbb_predict %>%
+  left_join(xbb, by = c("country", "date"))
+
+## extract mid-points for plotting
+xbb_midpoint <- xbb_predict %>%
+  group_by(country) %>%
+  summarise(t50 = min(t50))
+```
+
+```{r, fig.width=16, fig.height=8}
+## plot
+xbb_predict %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = pt)) +
+  geom_ribbon(aes(ymin = pt_min, ymax = pt_max), fill = "gray80", alpha = 0.5) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), size = 0.5, col = "gray50") +
+  geom_point(aes(y = xbb_prop)) +
+  geom_hline(aes(yintercept = 0.5), col = "black", linetype = "dotted") +
+  geom_vline(data = xbb_midpoint, aes(xintercept = t50), col = "black", linetype = "dotted") +
+  facet_wrap(~country) +
+  scale_x_date(date_labels = "%b-%y") +
+  labs(
+    x = "",
+    y = "Proportion XBB.1.5",
+    caption = "Shaded area represents uncertainty bounds based on growth advantage being 25% lower or higher"
+  ) 
+```
+
+```{r}
+## Canada province/territory-specific data
+## from: https://virusseq-dataportal.ca/explorer
+## data downloaded on 2023-04-04 for the period from 2023-10-01 onwards
+ca_variants_by_pt <- read_tsv(here("data", "virusseq-metadata-export-2023-04-04T17_05_45.405Z.tsv"))
+
+## count XBB1.5 and total sequences by PT and sample collection date
+xbb_by_pt <- ca_variants_by_pt %>%
+  mutate(
+    xbb15 = if_else(`lineage name` == "XBB.1.5", 1, 0)
+  ) %>%
+  group_by(study_id, `sample collection date`) %>%
+  summarise(xbb15 = sum(xbb15), total = n())
 ```
 
