@@ -195,36 +195,101 @@ xbb %>%
   geom_line() +
   scale_x_date(date_labels = "%b-%y")
 ```
+```{r}
+## exclude weeks with no XBB.1.5 detection
+xbb <- xbb %>%
+  filter(xbb_sequences > 0)
+
+## logistic regression to estimate growth advantage by country based on first 2 months of data (4 2-week periods)
+xbb <- xbb %>%
+  group_by(country) %>%
+  mutate(
+    t = row_number()
+  )
+  
+
+growth_estimates <- xbb %>%
+  filter(t <= 5) %>%
+  group_modify(
+    # Use `tidy`, `glance` or `augment` to extract different information from the fitted models.
+    ~ broom::tidy(glm(xbb_prop ~ t, data = ., weights = total_sequences, family = binomial("logit")))
+  )
+
+growth_estimates
+
+```
+```{r}
+## extract daily growth advantage
+rho_estimates <- growth_estimates %>%
+  filter(term == "t") %>%
+  select(country, estimate, std.error) %>%
+  mutate(
+    rho = estimate / 14,
+    rho_se = std.error / 14,
+    rho_lo = rho - 1.96*rho_se,
+    rho_hi = rho + 1.96*rho_se
+  )
+
+rho_estimates
+```
 
 ```{r}
 ## run model with country-specific parameters based on proportion of XBB1.5 on a specific month
-start_month <- lubridate::ym("2022-12")
+# start_month <- lubridate::ym("2022-12")
+# 
+# ## extract country-specific proportions on start date
+# xbb <- xbb %>%
+#   mutate(
+#     ym = lubridate::ym(str_sub(as.character(date), 1, 7))
+#   )
+#          
+# start_df <- xbb %>%
+#   filter(ym == start_month) %>%
+#   filter(date == min(date)) %>%
+#   arrange(country)
 
-## extract country-specific proportions on start date
-xbb <- xbb %>%
+## country-specific start dates (first week when variant detected)
+start_dates <- xbb %>%
+  group_by(country) %>%
+  summarise(start_date = min(date)) %>%
+  select(country, start_date)
+
+## country-specific growth advantage estimates (based on first 8 weeks)
+start_rho <- rho_estimates %>%
+  select(country, rho, rho_se)
+
+## country-specific starting proportions (mean of first two readings)
+start_props <- xbb %>%
+  filter(t <= 2) %>%
+  group_by(country) %>%
+  summarise(
+    xbb = sum(xbb_sequences),
+    total = sum(total_sequences)) %>%
   mutate(
-    ym = lubridate::ym(str_sub(as.character(date), 1, 7))
-  )
-         
-start_df <- xbb %>%
-  filter(ym == start_month) %>%
-  filter(date == min(date)) %>%
-  arrange(country)
+    xbb_prop = xbb / total
+  ) %>%
+  select(country, xbb_prop)
 
+start_df <- start_dates %>%
+  left_join(start_rho) %>%
+  left_join(start_props)
 ```
 
 ```{r}
 countries <- start_df %>% select(country) %>% pull() # vector of country names
 start_props <- start_df %>% select(xbb_prop) %>% pull() # vector of country-specific variant proportions
-start_date <- min(start_df$date) # start date of analysis
+start_rho <- start_df %>% select(rho) %>% pull()
+start_dates <- start_df %>% select(start_date) %>% pull() # start date of analysis
 t_end <- 120 # length of estimation period in days
-rho <- 0.08 # assumed growth advantage for new variant at the start of the analysis period
-rho_min <- rho * 0.75 # if growth advantage is 25% lower or 50% higher
-rho_max <- rho * 1.25
+#rho <- 0.08 # assumed growth advantage for new variant at the start of the analysis period
+#rho_min <- rho * 0.75 # if growth advantage is 25% lower or 50% higher
+#rho_max <- rho * 1.25
 
-estimate_pt_country <- function(input_countries, p) {
+estimate_pt_country <- function(input_countries, p, rho, start) { # arguments are country, starting proportion, growth advantage, start date
   
   mu <- (1 - p) / p
+  rho_min <- rho * 0.75 # if growth advantage is 25% lower or 50% higher
+  rho_max <- rho * 1.25
   
   ## calculate date when proportion reaches 50%
   t50 <- -1 * rho^-1 * (log(1-0.5) - log(mu * 0.5))
@@ -232,7 +297,7 @@ estimate_pt_country <- function(input_countries, p) {
   d <- tibble(
     country = rep(input_countries, t_end+1),
     t = c(0:t_end),
-    date = start_date + t
+    date = start + t
   )
   
   d <- d %>%
@@ -240,12 +305,13 @@ estimate_pt_country <- function(input_countries, p) {
       pt = 1 / (1 + mu * exp(1)^-(rho * t)),
       pt_min = 1 / (1 + mu * exp(1)^-(rho_min * t)),
       pt_max = 1 / (1 + mu * exp(1)^-(rho_max * t)),
-      t50 = start_date + t50
+      t50 = start + t50
     )
 
 }
 
-country_list <- map2(countries, start_props, estimate_pt_country)
+l <- list(input_countries = countries, p = start_props, rho = start_rho, start = start_dates) # match inputs to function arguments
+country_list <- pmap(l, estimate_pt_country) # generate estimates
 xbb_predict <- country_list %>% bind_rows()
 
 ## merge with observed data
@@ -286,9 +352,55 @@ ca_variants_by_pt <- read_tsv(here("data", "virusseq-metadata-export-2023-04-04T
 ## count XBB1.5 and total sequences by PT and sample collection date
 xbb_by_pt <- ca_variants_by_pt %>%
   mutate(
-    xbb15 = if_else(`lineage name` == "XBB.1.5", 1, 0)
+    xbb15 = if_else(`lineage name` == "XBB.1.5", 1, 0, missing = 0)
   ) %>%
   group_by(study_id, `sample collection date`) %>%
   summarise(xbb15 = sum(xbb15), total = n())
+
+## get week start date for sample date
+xbb_by_pt <- xbb_by_pt %>%
+  mutate(
+    sample_week = lubridate::floor_date(`sample collection date`, unit = "week", week_start = 1)
+  )
+
+## collapse by sample week
+xbb_by_pt <- xbb_by_pt %>%
+  group_by(study_id, sample_week) %>%
+  summarise(
+    xbb15 = sum(xbb15),
+    total = sum(total)
+  ) %>%
+  mutate(
+    xbb_prop = xbb15 / total
+  )
+```
+```{r}
+## plot variant proportion by PT
+xbb_by_pt %>%
+  ggplot(aes(x = sample_week, y = xbb_prop)) +
+  geom_col() +
+  facet_wrap(~study_id)
+```
+```{r}
+## find earliest detection week by province
+xbb_by_pt <- xbb_by_pt %>%
+  filter(xbb_prop > 0) %>%
+  arrange(study_id, sample_week) %>%
+  group_by(study_id) %>%
+  mutate(
+    earliest_date = min(sample_week)
+    ) %>%
+  ungroup
+
+## set start proportions as average of first two detection weeks
+start_props <- xbb_by_pt %>%
+  group_by(study_id) %>%
+  filter(row_number() <=2) %>%
+  summarise(
+    xbb15 = sum(xbb15),
+    total = sum(total),
+    xbb_prop = xbb15 / total
+  )
+
 ```
 
