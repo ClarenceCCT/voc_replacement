@@ -150,7 +150,7 @@ dat2_summary %>%
 ```{r}
 ## NOTE: data from CoV-SPECTRUM are cumulative not week-specific
 ## load XBB1.5 historical data from CoV-SPECTRUM
-# xbb <- read.csv(here("data", "cov-spectrum_xbb15.csv"), stringsAsFactors = FALSE)
+#xbb <- read.csv(here("data", "cov-spectrum_xbb15.csv"), stringsAsFactors = FALSE)
 # xbb <- xbb %>%
 #   mutate(date = as.Date(date))
 
@@ -200,7 +200,7 @@ xbb %>%
 xbb <- xbb %>%
   filter(xbb_sequences > 0)
 
-## logistic regression to estimate growth advantage by country based on first 2 months of data (4 2-week periods)
+## logistic regression to estimate growth advantage by country based on first 2 months of data (5 2-week periods)
 xbb <- xbb %>%
   group_by(country) %>%
   mutate(
@@ -254,21 +254,26 @@ start_dates <- xbb %>%
   summarise(start_date = min(date)) %>%
   select(country, start_date)
 
-## country-specific growth advantage estimates (based on first 8 weeks)
+## country-specific growth advantage estimates (based on first 10 weeks)
 start_rho <- rho_estimates %>%
   select(country, rho, rho_se)
 
-## country-specific starting proportions (mean of first two readings)
+## country-specific starting proportions (based on first two-week period when variant first detected)
 start_props <- xbb %>%
-  filter(t <= 2) %>%
-  group_by(country) %>%
-  summarise(
-    xbb = sum(xbb_sequences),
-    total = sum(total_sequences)) %>%
-  mutate(
-    xbb_prop = xbb / total
-  ) %>%
+  filter(t == 1) %>%
   select(country, xbb_prop)
+
+## country-specific starting proportions (mean of first two readings)
+# start_props <- xbb %>%
+#   filter(t <= 2) %>%
+#   group_by(country) %>%
+#   summarise(
+#     xbb = sum(xbb_sequences),
+#     total = sum(total_sequences)) %>%
+#   mutate(
+#     xbb_prop = xbb / total
+#   ) %>%
+#   select(country, xbb_prop)
 
 start_df <- start_dates %>%
   left_join(start_rho) %>%
@@ -339,9 +344,124 @@ xbb_predict %>%
   labs(
     x = "",
     y = "Proportion XBB.1.5",
-    caption = "Shaded area represents uncertainty bounds based on growth advantage being 25% lower or higher"
+    caption = "Growth advantage is estimated using first 10 weeks of variant detection\nShaded area represents uncertainty bounds based on growth advantage being 25% lower or higher"
   ) 
 ```
+```{r}
+## models with growth advantage estimated using all data
+growth_estimates2 <- xbb %>%
+  group_by(country) %>%
+  group_modify(
+    # Use `tidy`, `glance` or `augment` to extract different information from the fitted models.
+    .f = ~ broom::tidy(glm(xbb_prop ~ t, data = ., weights = total_sequences, family = binomial("logit")))
+  )
+
+## predicted values
+predict_df <- xbb %>%
+  group_modify(
+    .f = ~ broom::augment(glm(xbb_prop ~ t, data = ., weights = total_sequences, family = binomial("logit")), se_fit = TRUE)
+  ) %>%
+  mutate(
+    fitted_prop = boot::inv.logit(.fitted),
+    fitted_prop_lo = boot::inv.logit(.fitted - 1.96 * .se.fit),
+    fitted_prop_hi = boot::inv.logit(.fitted + 1.96 * .se.fit),
+    t = t - 1
+  )
+
+## merge dates
+predict_df <- predict_df %>%
+  left_join(start_df %>% select(country, start_date)) %>%
+  mutate(
+    date = start_date + (t * 7)
+    )
+
+growth_estimates2
+```
+
+```{r}
+## extract daily growth advantage
+rho_estimates <- growth_estimates2 %>%
+  filter(term == "t") %>%
+  select(country, estimate, std.error) %>%
+  mutate(
+    rho = estimate / 14,
+    rho_se = std.error / 14,
+    rho_lo = rho - 1.96*rho_se,
+    rho_hi = rho + 1.96*rho_se
+  )
+
+rho_estimates
+
+```
+
+```{r, fig.width=16, fig.height=8}
+## plot observed vs fitted
+predict_df %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = fitted_prop)) +
+  geom_ribbon(aes(ymin = fitted_prop_lo, ymax = fitted_prop_hi), fill = "gray80", alpha = 0.5) +
+  #geom_errorbar(aes(ymin = Lower, ymax = Upper), size = 0.5, col = "gray50") +
+  geom_point(aes(y = xbb_prop)) +
+  geom_hline(aes(yintercept = 0.5), col = "black", linetype = "dotted") +
+  geom_vline(data = xbb_midpoint, aes(xintercept = t50), col = "black", linetype = "dotted") +
+  facet_wrap(~country) +
+  scale_x_date(date_labels = "%b-%y") +
+  labs(
+    x = "",
+    y = "Proportion XBB.1.5",
+    caption = "Growth advantage is estimated using first 10 weeks of variant detection\nShaded area represents uncertainty bounds based on growth advantage being 25% lower or higher"
+  ) 
+```
+```{r}
+## import vaccination data from OWID
+vax_data <- read_csv(here("data", "owid-covid-data.csv"))
+#uk_countries <- c("United Kingdom", "England", "Scotland", "Wales", "Northern Ireland")
+
+vax_data2 <- vax_data %>%
+  filter(location %in% c(countries, "England")) %>%
+  select(country = location, date, people_vaccinated_per_hundred, people_fully_vaccinated_per_hundred, total_vaccinations_per_hundred, total_boosters_per_hundred) %>%
+  filter(country != "United Kingdom") %>%
+  mutate(
+    country = if_else(country == "England", "United Kingdom", country) # use England as indicator of vaccine coverage across UK
+  ) %>%
+  left_join(
+    start_df %>% select(country, start_date)
+  ) 
+
+## use highest vaccine uptake figures for 2022
+vax_data2 <- vax_data2 %>%
+  mutate(
+    year = lubridate::year(date)
+  ) %>%
+  group_by(country, year) %>%
+  summarise(
+    vaccinated_2022 = max(people_vaccinated_per_hundred, na.rm = TRUE),
+    fully_vaccinated_2022 = max(people_fully_vaccinated_per_hundred, na.rm = TRUE),
+    total_vaccinations_2022 = max(total_vaccinations_per_hundred, na.rm = TRUE),
+    total_boosters_2022 = max(total_boosters_per_hundred, na.rm = TRUE)
+  ) %>%
+  ungroup %>%
+  filter(year == 2022)
+
+## reshape to long format
+vax_data2_long <- vax_data2 %>%
+  pivot_longer(-c(country, year), names_to = "indicator", values_to = "value")
+
+## merge with growth estimates data
+vax_data2_long <- vax_data2_long %>%
+  left_join(rho_estimates, by = "country")
+```
+
+```{r, fig.height=9, fig.width = 12}
+## plot vaccine coverage indicators against daily growth rate for different countries
+vax_data2_long %>%
+  ggplot(aes(x = value, y = rho)) +
+  geom_point() +
+  geom_text(aes(label = country), size = 2, vjust = 1, hjust = 1) +
+  facet_wrap(~indicator, scales = "free_x") + 
+  scale_y_continuous(limits = c(0.04,0.1), breaks = seq(0.04, 0.1, 0.02))
+```
+
 
 ```{r}
 ## Canada province/territory-specific data

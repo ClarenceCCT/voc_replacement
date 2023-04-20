@@ -1,0 +1,42 @@
+---
+title: "Cov-Spectrum XBB1.16 data"
+output: 
+  html_notebook:
+    code_folding: hide
+---
+
+```{r, setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 9)
+```
+
+```{r}
+#library(jsonlite)
+library(tidyverse)
+library(here)
+#library(ggrepel)
+
+rm(list = ls())
+```
+
+```{r}
+## load data
+xbb116 <- read.csv(here("data", "cov-spectrum_xbb116_2023-04-14.csv"), stringsAsFactors = FALSE)
+
+xbb116 <- xbb116 %>%
+  mutate(
+    date = as.Date(date)
+  )
+```
+
+Data are proportions of XBB.1.6 sequences downloaded from Cov-Spectrum for countries {r unique(xbb116$location)}. Note that the data do not include the number of sequences submitted
+```{r}
+## plot data
+xbb116 %>%
+  filter(date >= as.Date("2023-01-01") & date <= as.Date("2023-04-01")) %>%
+  ggplot(aes(x = date, y = proportion, group = location)) +
+  geom_line() +
+  facet_wrap(~location) +
+  scale_x_date(date_labels = "%b-%y")
+```
+
+

@@ -1,0 +1,327 @@
+---
+title: "XBB.1.5 growth vs vaccine coverage"
+output: 
+  html_notebook:
+    code_folding: hide
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 9)
+```
+
+```{r}
+library(jsonlite)
+library(tidyverse)
+library(here)
+library(ggrepel)
+```
+
+```{r}
+## download variant data from Co-Variants website
+url <- "https://raw.githubusercontent.com/hodcroftlab/covariants/master/cluster_tables/EUClusters_data.json"
+
+json_data <- fromJSON(url, simplifyDataFrame = FALSE)
+```
+
+```{r}
+## get list of countries
+json_countries <- names(json_data$countries)
+
+## function to extract country data into dataframe
+get_country_data <- function(l, c) {
+  
+  d <- as_tibble(l)
+  d <- d %>%
+    mutate(
+      country = c
+    )
+  
+}
+
+country_data <- map2_df(json_data$countries, json_countries, get_country_data)
+```
+
+```{r, fig.height=9, fig.width=12}
+vname <- c("23A (Omicron)")
+#vname <- c("22B (Omicron)")
+#vname <- c("21L (Omicron)")
+
+## count XBB.1.5 sequences by country
+xbb_count <- country_data %>%
+  group_by(country) %>%
+  summarise(xbb_sequences = sum(!!sym(vname)))
+  #summarise(xbb_sequences = sum(`22B (Omicron)`))
+
+## plot number of XBB.1.5 sequences for countries with >=100 sequences
+xbb_count %>%
+  filter(!is.na(xbb_sequences) & xbb_sequences > 100) %>%
+  ggplot(aes(x = fct_reorder(country, xbb_sequences), y = xbb_sequences)) +
+    geom_col() + 
+  geom_text(aes(label = xbb_sequences), size = 2, hjust = -0.25) +
+  coord_flip()
+```
+
+```{r}
+## filter countries with >=100 sequences
+xbb_top100 <- xbb_count %>%
+  filter(xbb_sequences >= 100) %>%
+  select(country) %>%
+  pull()
+
+xbb_top100_data <- country_data %>%
+  filter(country %in% xbb_top100) %>%
+  select(country, date = week, total_sequences, xbb15 = vname)
+
+## calculate proportion
+xbb_top100_data <- xbb_top100_data %>%
+  mutate(
+    xbb_prop = xbb15 / total_sequences,
+    date = as.Date(date)
+  )
+
+## exclude weeks with no XBB.1.5 detection
+xbb_top100_data <- xbb_top100_data %>%
+  filter(xbb15 > 0)
+
+## fill in missing weeks
+xbb_top100_data <- forecastML::fill_gaps(xbb_top100_data, date_col = 2, frequency = "14 days", groups = "country", static_features = NULL)
+
+## count number of weeks for which data available
+xbb_top100_data <- xbb_top100_data %>%
+  mutate(
+    data_available = if_else(!is.na(xbb_prop), 1, 0)
+  ) %>%
+  group_by(country) %>%
+  mutate(
+    data_weeks = sum(data_available)
+  ) %>%
+  ungroup
+
+## remove if <12 weeks of data
+xbb_top100_data <- xbb_top100_data %>%
+  filter(data_weeks >= 6)
+
+```
+
+```{r, fig.height=9, fig.width=12}
+## plot by country
+xbb_top100_data %>%
+  ggplot(aes(x = date, y = xbb_prop)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~country) +
+  labs(
+    y = "Proportion"
+  )
+```
+```{r}
+## logistic regression to estimate growth advantage by country based on first 2 months of data (5 2-week periods)
+xbb_top100_data <- xbb_top100_data %>%
+  group_by(country) %>%
+  mutate(
+    t = row_number(),
+    max_prop = max(xbb_prop, na.rm = TRUE),
+    max_t_flag = if_else(xbb_prop == max_prop, t, as.integer(0), missing = as.integer(0)),
+    max_t = max(max_t_flag)
+  )
+  
+growth_estimates <- xbb_top100_data %>%
+  filter(t <= 4) %>%
+    group_modify(
+    # Use `tidy`, `glance` or `augment` to extract different information from the fitted models.
+    ~ broom::tidy(glm(xbb_prop ~ t, data = ., weights = total_sequences, family = binomial("logit")))
+  )
+
+rho_estimates <- growth_estimates %>%
+  filter(term == "t") %>%
+  select(country, estimate, std.error) %>%
+  mutate(
+    rho = estimate / 14,
+    rho_se = std.error / 14,
+    rho_lo = rho - 1.96*rho_se,
+    rho_hi = rho + 1.96*rho_se
+  )
+
+rho_estimates
+```
+```{r}
+## predicted values
+predict_df <- xbb_top100_data %>%
+  filter(t <= max_t) %>%
+  group_modify(
+    .f = ~ broom::augment(glm(xbb_prop ~ t, data = ., weights = total_sequences, family = binomial("logit")), se_fit = TRUE)
+  ) %>%
+  mutate(
+    fitted_prop = boot::inv.logit(.fitted),
+    fitted_prop_lo = boot::inv.logit(.fitted - 1.96 * .se.fit),
+    fitted_prop_hi = boot::inv.logit(.fitted + 1.96 * .se.fit)
+  )
+
+## merge dates
+predict_df <- predict_df %>%
+  left_join(xbb_top100_data %>% select(country, date, t), by = c("country", "t"))
+
+## change USA to United States
+predict_df <- predict_df %>%
+  mutate(
+    country = case_when(
+      country == "USA" ~ "United States", 
+      country == "United Kingdom" ~ "England",
+      TRUE ~ country)
+  )
+```
+
+```{r, fig.width=16, fig.height=8}
+## plot observed vs fitted
+predict_df %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = fitted_prop)) +
+  geom_ribbon(aes(ymin = fitted_prop_lo, ymax = fitted_prop_hi), fill = "gray80", alpha = 0.5) +
+  #geom_errorbar(aes(ymin = Lower, ymax = Upper), size = 0.5, col = "gray50") +
+  geom_point(aes(y = xbb_prop)) +
+  geom_hline(aes(yintercept = 0.5), col = "black", linetype = "dotted") +
+  facet_wrap(~country) +
+  scale_x_date(date_labels = "%b-%y") +
+  labs(
+    title = paste(vname, "growth by country"),
+    x = "",
+    y = "Proportion"
+  ) +
+  theme(
+    axis.text.x = element_text(size = 5)
+  )
+```
+```{r}
+## save
+fname <- paste0("growth_by_country", vname, ".png")
+ggsave(file = here("plots", fname), device = "png", dpi = 300, width = 16, height = 8)
+```
+
+```{r}
+## combined plot highlighting Canada
+ggplot() +
+  geom_line(data = predict_df, aes(x = date, y = fitted_prop, group = country), col = "gray80", size = 0.1) +
+  geom_line(data = predict_df %>% filter(country == "Canada"), aes(x = date, y = fitted_prop), col = "black", size = 1) +
+  geom_text_repel(data = predict_df %>% filter(country == "Canada" & row_number() == max(row_number())), aes(x = date, y = fitted_prop, label = country), size = 2) +
+  #geom_ribbon(aes(ymin = fitted_prop_lo, ymax = fitted_prop_hi), fill = "gray80", alpha = 0.5) +
+  #geom_errorbar(aes(ymin = Lower, ymax = Upper), size = 0.5, col = "gray50") +
+  #geom_point(aes(y = xbb_prop)) +
+  geom_hline(aes(yintercept = 0.5), col = "black", linetype = "dotted") +
+  #facet_wrap(~country) +
+  scale_x_date(date_labels = "%b-%y") +
+  labs(
+    title = paste(vname, "growth by country"),
+    x = "",
+    y = "Proportion"
+  ) +
+  theme(
+    axis.text.x = element_text(size = 5)
+  )
+```
+
+
+```{r}
+## get vaccination data
+countries <- unique(predict_df$country)
+
+vax_data <- read_csv(here("data", "owid-covid-data.csv"))
+
+vax_data_xbb <- vax_data %>%
+  filter(location %in% countries) %>%
+  select(country = location, date, people_vaccinated_per_hundred, people_fully_vaccinated_per_hundred, total_vaccinations_per_hundred, total_boosters_per_hundred)
+
+## use highest vaccine uptake figures for 2022
+# vax_data_2022 <- vax_data_xbb %>%
+#   mutate(
+#     year = lubridate::year(date)
+#   ) %>%
+#   group_by(country, year) %>%
+#   summarise(
+#     vaccinated_2022 = max(people_vaccinated_per_hundred, na.rm = TRUE),
+#     fully_vaccinated_2022 = max(people_fully_vaccinated_per_hundred, na.rm = TRUE),
+#     total_vaccinations_2022 = max(total_vaccinations_per_hundred, na.rm = TRUE),
+#     total_boosters_2022 = max(total_boosters_per_hundred, na.rm = TRUE)
+#   ) %>%
+#   ungroup %>%
+#   filter(year == 2022)
+
+## use highest vaccine uptake figures up to date of variant first detection
+start_dates <- xbb_top100_data %>%   ## get date of first detection
+  group_by(country) %>%
+  summarise(first_date = min(date)) 
+
+vax_data_2022 <- vax_data_xbb %>%
+  left_join(start_dates) %>%
+  filter(date <= first_date) %>%
+  group_by(country) %>%
+  summarise(
+    vaccinated_2022 = max(people_vaccinated_per_hundred, na.rm = TRUE),
+    fully_vaccinated_2022 = max(people_fully_vaccinated_per_hundred, na.rm = TRUE),
+    total_vaccinations_2022 = max(total_vaccinations_per_hundred, na.rm = TRUE),
+    total_boosters_2022 = max(total_boosters_per_hundred, na.rm = TRUE)
+  ) %>%
+  ungroup 
+
+## reshape to long format
+vax_data2_long <- vax_data_2022 %>%
+  pivot_longer(-country, names_to = "indicator", values_to = "value")
+
+## merge with growth estimates data
+rho_estimates <- rho_estimates %>%
+  mutate(
+    country = case_when(
+      country == "USA" ~ "United States", 
+      country == "United Kingdom" ~ "England",
+      TRUE ~ country)
+  )
+
+vax_data2_long <- vax_data2_long %>%
+  left_join(rho_estimates, by = "country")
+
+## replace -Inf with NA
+vax_data2_long <- vax_data2_long %>%
+  mutate(
+    value = if_else(value == -Inf, NA_real_, value)
+  )
+
+```
+
+```{r}
+## plot vaccine indicators
+vax_data2_long %>%
+  ggplot() +
+  geom_histogram(aes(x = value)) +
+  facet_wrap(~indicator)
+```
+
+
+```{r, fig.height=9, fig.width = 12}
+## plot vaccine coverage indicators against daily growth rate for different countries
+
+max_rho <- plyr::round_any(max(vax_data2_long$rho, na.rm = TRUE), accuracy = 0.01, f = ceiling) # round up maximum rho value for y-axis range
+
+vax_data2_long %>%
+  mutate(wt = 1 / std.error) %>%
+  filter(country != "Luxembourg") %>% ## exclude Luxembourg as no data on fully vaccinated
+  ggplot(aes(x = value, y = rho)) +
+  geom_point(aes(size = wt)) +
+  geom_text_repel(aes(label = country), size = 2) + #, vjust = 1, hjust = 1) +
+  geom_smooth(method='lm', weight = "wt") +
+  facet_wrap(~indicator, scales = "free_x") + 
+  scale_y_continuous(limits = c(0.0, max_rho), breaks = seq(0.0, max_rho, 0.02)) + 
+  labs(
+    title = paste(vname, "growth vs vaccine coverage")
+  )
+
+```
+
+```{r}
+## save
+fname <- paste0("growth_vs_vaccination_", vname, ".png")
+ggsave(file = here("plots", fname), device = "png", dpi = 300, width = 12, height = 9)
+```
+```{r}
+broom::tidy(lm(rho ~ value, data = vax_data2_long, subset = (indicator == "fully_vaccinated_2022")))
+```
+
+

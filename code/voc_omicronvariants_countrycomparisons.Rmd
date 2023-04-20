@@ -1,0 +1,228 @@
+---
+title: "Cross-country comparison of Omicron variant growth rates and dominance"
+output: 
+  html_notebook:
+    code_folding: hide
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 9)
+```
+
+```{r}
+## load libraries
+library(jsonlite)
+library(tidyverse)
+library(here)
+library(ggrepel)
+```
+
+```{r}
+## download variant data from Co-Variants website
+url <- "https://raw.githubusercontent.com/hodcroftlab/covariants/master/cluster_tables/EUClusters_data.json"
+
+json_data <- fromJSON(url, simplifyDataFrame = FALSE)
+```
+
+```{r}
+## get list of countries
+json_countries <- names(json_data$countries)
+
+## function to extract country data into dataframe
+get_country_data <- function(l, c) {
+  
+  d <- as_tibble(l)
+  d <- d %>%
+    mutate(
+      country = c
+    )
+  
+}
+
+country_data <- map2_df(json_data$countries, json_countries, get_country_data)
+```
+
+```{r}
+## plot variant proportions over time for select countries
+countries <- c("Canada", "USA", "Mexico", "United Kingdom", "France", "Germany", "Spain") #, "India")
+my_cols <- c("red", "red", "red", rep("gray", 4))
+my_alphas <- c(1, 0.5, 0.25, 0.8, 0.6, 0.4, 0.2)
+
+select_data <- country_data %>%
+  filter(country %in% countries)
+
+select_data <- select_data %>%
+  select(country, week, total_sequences, `21K (Omicron)`:`23A (Omicron)`)
+
+select_data_long <- select_data %>%
+  pivot_longer(`21K (Omicron)`:`23A (Omicron)`, names_to = "voc", values_to = "sequences") %>%
+  mutate(
+    prop = sequences / total_sequences,
+    country = factor(country, levels = countries, labels = countries),
+    date = as.Date(week)
+  ) %>%
+  arrange(country, voc, week)
+
+select_data_long %>%
+  ggplot(aes(x = date, y = prop, group = country, col = country, alpha = country)) +
+  geom_line() +
+  #geom_point() +
+  facet_wrap(~voc) + 
+  scale_x_date(date_labels = "%b-%y") +
+  scale_colour_manual(values = my_cols) +
+  scale_alpha_manual(values = my_alphas)
+```
+
+```{r}
+## data for all countries
+all_countries <- country_data %>%
+  select(country, week, total_sequences, `21K (Omicron)`:`23A (Omicron)`)
+
+all_countries_long <- all_countries %>%
+  pivot_longer(`21K (Omicron)`:`23A (Omicron)`, names_to = "voc", values_to = "sequences") %>%
+  mutate(
+    prop = sequences / total_sequences,
+    date = as.Date(week)
+  ) %>%
+  arrange(country, voc, week)
+
+## exclude countries with <100 sequences and <12 weeks detection
+all_countries_long <- all_countries_long %>%
+  group_by(country, voc) %>%
+  mutate(
+    sequence_count = sum(sequences),
+    #data_available = if_else(!is.na(prop), 1, 0),
+    #data_weeks = sum(data_available)
+  ) %>%
+  filter(sequence_count > 100)
+
+## identify weeks of first detection
+all_countries_long <- all_countries_long %>%
+  group_by(country, voc) %>%
+  mutate(
+    detection = if_else(sequences > 0, 1, 0)
+  ) %>% 
+  group_by(country, voc, detection) %>%
+  mutate(
+    first_detect_week = min(date)
+  ) %>%
+  ungroup
+
+all_countries_long <- all_countries_long %>%
+  mutate(
+    first_detect_week = if_else(sequences > 0, first_detect_week, as.Date(NA))
+  )
+
+all_countries_long <- all_countries_long %>%
+  group_by(country, voc) %>%
+  mutate(
+    first_detect_week = if_else(is.na(first_detect_week), min(first_detect_week, na.rm = TRUE), first_detect_week)
+  )
+
+## filter out dates before first detection date
+all_countries_long <- all_countries_long %>%
+  filter(date >= first_detect_week)
+
+## fill in missing weeks
+all_countries_long <- forecastML::fill_gaps(all_countries_long, date_col = 7, frequency = "14 days", groups = c("country", "voc"), static_features = NULL)
+
+```
+
+```{r}
+## logistic regression to estimate growth advantage by country based on first 2 months of data (4 2-week periods)
+all_countries_long <- all_countries_long %>%
+  group_by(country, voc) %>%
+  mutate(
+    t = row_number(),
+    max_prop = max(prop, na.rm = TRUE),
+    max_t_flag = if_else(prop == max_prop, t, as.integer(0), missing = as.integer(0)),
+    max_t = max(max_t_flag)
+  )
+  
+growth_estimates <- all_countries_long %>%
+  filter(t <= 4) %>%
+    group_modify(
+    # Use `tidy`, `glance` or `augment` to extract different information from the fitted models.
+    ~ broom::tidy(glm(prop ~ t, data = ., weights = total_sequences, family = binomial("logit")))
+  )
+
+rho_estimates <- growth_estimates %>%
+  filter(term == "t") %>%
+  select(country, estimate, std.error) %>%
+  mutate(
+    rho = estimate / 14,
+    rho_se = std.error / 14,
+    rho_lo = rho - 1.96*rho_se,
+    rho_hi = rho + 1.96*rho_se
+  )
+
+rho_estimates
+```
+
+```{r}
+## generate dataframe of maximum proportion by variant and country
+max_props <- all_countries_long %>%
+  group_by(country, voc) %>%
+  mutate(
+    max_prop = max(prop, na.rm = TRUE),
+    max_t = if_else(prop == max_prop, t, NA_integer_),
+    max_date = if_else(prop == max_prop, date, as.Date(NA))
+  ) %>%
+  summarise(
+    max_prop = max(max_prop, na.rm = TRUE),
+    max_t = max(max_t, na.rm = TRUE),
+    max_date = max(max_date, na.rm = TRUE)
+  )
+```
+```{r}
+## merge rho estimates with maximum proportion
+rho_estimates <- rho_estimates %>%
+  left_join(max_props, by = c("country", "voc"))
+```
+
+```{r, fig.height = 9, fig.width = 12}
+## plot rho vs maximum variant proportion
+country_labels <- c("USA", "Canada", "Mexico", "United Kingdom", "Germany", "South Africa", "Singapore", "India")
+## colours for plots
+my_red <- "#BF4545"
+my_blue <- "#7A9FBF"
+my_orange <- "#EBB920"
+my_cols <- c("gray30", my_red)
+
+rho_estimates <- rho_estimates %>%
+  mutate(
+    country_label = if_else(country %in% country_labels, country, NA_character_),
+    coloured_marker = if_else(!is.na(country_label), TRUE, FALSE)
+  )
+
+rho_estimates %>%
+  filter(rho > 0 & rho < 1) %>%
+  ggplot(aes(x = rho, y = max_prop, col = coloured_marker)) +
+  geom_point(aes(size = 1/rho_se), shape = 1, col = "gray20") +
+  geom_hline(aes(yintercept = 0.5), col = "black", linetype = "dashed", size = 0.5) +
+  geom_text_repel(aes(label = country_label), size = 2) +
+  facet_wrap(~voc) +
+  scale_colour_manual(values = my_cols)
+```
+```{r, , fig.height = 9, fig.width = 12}
+## plot rho vs max proportion across all variants, faceting by country
+rho_estimates %>%
+  filter(country %in% country_labels & rho > 0) %>%
+  ggplot(aes(x = rho, y = max_prop)) +
+  geom_point(aes(size = 1/rho_se), shape = 1, col = "gray20") +
+  geom_hline(aes(yintercept = 0.5), col = "black", linetype = "dashed", size = 0.5) +
+  geom_text_repel(aes(label = voc), size = 2) +
+  facet_wrap(~country)
+```
+
+
+```{r, fig.height = 9, fig.width = 12}
+## plot rho vs days from detection to maximum variant proportion
+rho_estimates %>%
+  filter(rho > 0 & rho < 1) %>%
+  ggplot(aes(x = rho, y = max_t * 14)) +
+  geom_point(aes(size = 1/rho_se), shape = 1, col = "gray20") +
+  #geom_text_repel(aes(label = country), size = 2) +
+  facet_wrap(~voc)
+```
+
