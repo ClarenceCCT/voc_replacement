@@ -15,26 +15,438 @@ library(jsonlite)
 library(tidyverse)
 library(here)
 library(ggrepel)
+library(patchwork)
 ```
 
 ```{r}
 ## load data
 rm(list = ls())
 dat <- read_tsv(here("data", "virusseq-metadata-export-2023-04-20T16_09_15.417Z.tsv"))
+
+## create week variable
+dat <- dat %>%
+  mutate(
+    week = lubridate::floor_date(`sample collection date`, unit = "week", week_start = 1)
+  )
 ```
+
 ```{r}
+## create dataframe with weekly sequence totals, excluding unassigned sequences
+weekly_totals <- dat %>%
+  filter(!is.na(`lineage name`)) %>%
+  group_by(week) %>%
+  summarise(
+    total_sequences = n()
+  )
+
 ## filter variants of interest
 #head(dat)
 
-variants <- c("BA.1.1", "BA.2", "BA.5.2.1", "BA.2.12.1", "BA.1", "BQ.1.1", "BQ.1", "XBB.1.5", "XBB.1.16")
+variants <- c("BA.1", "BA.1.1", "BA.2", "BA.2.12.1", "BA.5.2.1", "BQ.1", "BQ.1.1", "XBB.1.5", "XBB.1.16") # exclude BA.2, BA.1.1 and BA.1 as these appeared at the start of earliest data collection
 
 dat2 <- dat %>%
   filter(`lineage name` %in% variants)
 
-## create week variable
-dat2 <- dat %>%
+```
+
+```{r}
+dat3 <- dat2 %>%
+  rename("voc" = `lineage name`) %>%
+  select("location" = study_id, voc, week) %>%
+  group_by(week) %>%
+  count(voc)  # count variant sequences per week
+
+## fill in missing weeks in time series
+dat3 <- forecastML::fill_gaps(dat3, date_col = 1, frequency = "7 days", groups = "voc", static_features = NULL)
+
+## fill in total_sequences values in missing weeks
+dat3 <- dat3 %>%
+  group_by(week) %>%
+  replace_na(list(n = 0))
+
+## merge aggregate counts by week
+dat3 <- dat3 %>%
+  left_join(weekly_totals, by = "week")
+  
+## create weekly proportion and factor variable for lineages
+dat3 <- dat3 %>%
   mutate(
-    sample_week = lubridate::floor_date(`sample collection date`, unit = "week", week_start = 1)
+    prop = n / total_sequences,
+    voc = factor(voc, levels = variants, labels = variants)
+  )
+```
+
+```{r}
+## plot total sequences over time
+dat3 %>%
+  group_by(week) %>%
+  summarise(total_sequences = mean(total_sequences, na.rm = TRUE)) %>%
+  ggplot(aes(x = week, y = total_sequences)) +
+  geom_col(fill = "gray50", alpha = 0.5, col = "gray50")
+```
+
+
+```{r, fig.width = 12, fig.height = 9}
+my_blues <- RColorBrewer::brewer.pal(length(variants), 'Blues')[2:length(variants)]
+my_red <- "#BF4545"
+my_cols <- c(my_blues, my_red)
+my_sizes <- c(rep(0.5, length(my_blues)), 1)
+
+## plot variant counts over time
+p <- dat3 %>%
+  ggplot(aes(x = week, y = n, group = voc, col = voc, size = voc)) +
+  geom_rect(aes(xmin = max(dat3$week)-14, xmax = max(dat3$week), ymin = 0, ymax = plyr::round_any(max(dat3$n), 1000, f = ceiling)), fill = "gray80", col = "gray80", alpha = 0.25) +
+  geom_line() +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b-%y") +
+  scale_y_continuous(limits = c(0, plyr::round_any(max(dat3$n), 1000, f = ceiling))) +
+  scale_colour_manual(values = my_cols) + 
+  scale_size_manual(values = my_sizes) +
+  labs(
+    x = "Sample collection date",
+    y = "Weekly samples collected",
+    col = "Lineage",
+    size = "Lineage"
+  ) 
+
+p
+```
+```{r, fig.width = 12, fig.height = 9}
+## plot variant proportions over time
+p1 <- dat3 %>%
+  ggplot(aes(x = week, y = prop, group = voc, col = voc, size = voc)) +
+  geom_line() +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b-%y") +
+  scale_colour_manual(values = my_cols) + 
+  scale_size_manual(values = my_sizes) +
+  labs(
+    x = "Sample collection date",
+    y = "Proportion of sequences",
+    col = "Lineage",
+    size = "Lineage"
+  )
+
+p1
+```
+```{r}
+## align variant time series from week of first detection
+dat3 <- dat3 %>%
+  group_by(voc) %>%
+  mutate(
+    t = row_number()
+  )
+```
+
+```{r, fig.width = 12, fig.height = 9}
+## plot aligned lineages
+dat3 %>%
+  ggplot(aes(x = t, y = prop, group = voc, col = voc, size = voc)) +
+  geom_line() +
+  scale_x_continuous(limits = c(0,20), breaks = seq(0, 20, 2)) +
+  scale_colour_manual(values = my_cols) + 
+  scale_size_manual(values = my_sizes) +
+  labs(
+    x = "Weeks since first detection",
+    y = "Proportion of sequences",
+    col = "Lineage",
+    size = "Lineage"
+  )
+```
+```{r}
+## calculate Simpson's diversity index by week
+
+## aggregate data to weekly counts by variant
+dat_weekly <- dat %>%
+  rename("voc" = `lineage name`) %>%
+  filter(!is.na(voc)) %>% # exclude unassigned sequences
+  group_by(week) %>%
+  mutate(
+    total_sequences = n()
+  ) %>%
+  ungroup %>%
+  group_by(week, total_sequences) %>%
+  count(voc)
+
+dat_simpsons <- dat_weekly %>%
+  mutate(
+    a = n * (n - 1)
+    )
+
+dat_simpsons <- dat_simpsons %>%
+  group_by(week) %>%
+  summarise(
+    a = sum(a),
+    b = mean(total_sequences)
+  ) %>%
+  mutate(
+    c = b * (b - 1),
+    d = 1 - a / c
+  )
+
+```
+
+```{r}
+## plot weekly Simpson's index
+dat_simpsons %>%
+  ggplot(aes(x = week, y = d)) +
+  geom_line() + 
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b-%y")
+```
+```{r, fig.width = 12, fig.height = 9}
+## plot variant proportions and Simpson's D over time
+ggplot() +
+  geom_line(data = dat3, aes(x = week, y = prop, group = voc, col = voc, size = voc)) +
+  geom_line(data = dat_simpsons %>% filter(week > as.Date("2021-11-01")), aes(x = week, y = d)) +
+  scale_x_date(limits = c(as.Date("2021-11-01"), as.Date("2023-03-20")),date_breaks = "1 month", date_labels = "%b-%y") +
+  scale_colour_manual(values = my_cols) + 
+  scale_size_manual(values = my_sizes) +
+  labs(
+    x = "Sample collection date",
+    y = "Proportion of sequences",
+    col = "Lineage",
+    size = "Lineage"
+  )
+```
+```{r, fig.height=9, fig.width=12}
+## load case data from OWID
+owid <- read_csv(here("data", "owid-covid-data.csv"))
+
+case_df <- owid %>%
+  filter(location == "Canada" & date > as.Date("2021-11-01")) %>%
+  select(location, date, new_cases, new_deaths, weekly_hosp_admissions) 
+
+## note that only weekly totals are reported from June 2022
+## aggregate to weekly time series
+
+weekly_cases <- case_df %>%
+  mutate(
+    week = lubridate::floor_date(date, unit = "week", week_start = 1)
+  ) %>%
+  group_by(week) %>%
+  summarise(
+    cases = sum(new_cases),
+    deaths = sum(new_deaths)
+  )
+
+p2 <- weekly_cases %>%
+  ggplot(aes(x = week, y = cases)) +
+  geom_line() +
+  scale_y_continuous(labels = scales::comma) +
+  scale_x_date(limits = c(as.Date("2021-11-01"), as.Date("2023-03-20")),date_breaks = "1 month", date_labels = "%b-%y") +
+  labs(
+    y = "New cases in week",
+    x = "Reporting date"
+  )
+
+p2
+```
+```{r, fig.height=6, fig.width=12}
+
+#dat3 <- dat3 %>%
+#  left_join(weekly_cases, by = "week")
+
+#p2 <- p1 %+% aes(y = cases)
+
+#result <- p2 / p1 +
+#  plot_layout(heights = c(1, 2))
+#gt <- patchwork::patchworkGrob(result)
+#gridExtra::grid.arrange(gt) #, left = "Disp", bottom = "Hp // Cyl")
+```
+
+
+```{r}
+## calculate week of maximum variant activity
+dat3 <- dat3 %>%
+  group_by(voc) %>%
+  mutate(
+    max_prop = max(prop),
+    max_t = if_else(prop == max_prop, t, NA_integer_)
+  )
+
+dat3 <- dat3 %>%
+  mutate(
+    max_t = max(max_t, na.rm = TRUE)
+  ) %>%
+  ungroup
+
+```
+
+```{r}
+## fit growth model for each variant
+dat4 <- dat3 %>%
+  filter(t <= max_t) %>%
+  mutate(
+    day = (t - 1) * 14  ## create day variable
+  )
+
+growth_estimates <- dat4 %>%
+  group_by(voc) %>%
+  group_modify(
+    # Use `tidy`, `glance` or `augment` to extract different information from the fitted models.
+    .f = ~ broom::tidy(glm(prop ~ day, data = ., weights = total_sequences, family = binomial("logit")))
+  )
+
+rho_estimates <- growth_estimates %>%
+  #filter(term == "day") %>%
+  select(voc, term, estimate, std.error) %>%
+  mutate(
+    rho = estimate,
+    rho_se = std.error,
+    rho_lo = rho - 1.96*rho_se,
+    rho_hi = rho + 1.96*rho_se
+  ) %>%
+  select(-estimate, -std.error)
+
+rho_estimates
+
+# rho_estimates2 <- left_join(
+#   rho_estimates %>% filter(term == "(Intercept)") %>% select(voc, "intercept" = rho, "intercept_se" = rho_se),
+#   rho_estimates %>% filter(term == "day") %>% select(voc, rho, rho_se, rho_lo, rho_se),
+#   by = "voc"
+# ) %>%
+#   mutate(
+#     intercept = intercept / 14
+#   )
+
+```
+```{r}
+## calculated fitted values
+weekly_prop_fit <- dat4 %>%
+  group_by(voc) %>%
+  group_modify(
+    # Use `tidy`, `glance` or `augment` to extract different information from the fitted models.
+    .f = ~ broom::augment(glm(prop ~ day, data = ., weights = total_sequences, family = binomial("logit")), se_fit = TRUE)
+  ) %>%
+  mutate(
+    fitted_prop = boot::inv.logit(.fitted),
+    fitted_prop_lo = boot::inv.logit(.fitted - 1.96 * .se.fit),
+    fitted_prop_hi = boot::inv.logit(.fitted + 1.96 * .se.fit)
+  )
+
+## merge dates
+weekly_prop_fit <- weekly_prop_fit %>%
+  left_join(dat4 %>% select(voc, t, week, day), by = c("voc", "day"))
+
+```
+
+```{r, fig.height=9, fig.height=12}
+## plot fitted vs observed
+weekly_prop_fit %>%
+  ggplot() +
+  geom_ribbon(aes(x = week, ymin = fitted_prop_lo, ymax = fitted_prop_hi), alpha = 0.5, fill = "gray80", col = "gray80") +
+  geom_line(aes(x = week, y = fitted_prop)) +
+  geom_point(aes(x = week, y = prop)) +
+  facet_wrap(~voc)
+```
+
+```{r}
+## merge with weekly case data
+weekly_prop_fit <- weekly_prop_fit %>%
+  left_join(weekly_cases, by = "week")
+
+## estimate weekly variant cases
+weekly_prop_fit <- weekly_prop_fit %>%
+  mutate(
+    variant_cases = cases * fitted_prop,
+    variant_cases_lo = cases * fitted_prop_lo,
+    variant_cases_hi = cases * fitted_prop_hi
+  )
+```
+
+```{r, fig.height = 9, fig.width = 12}
+## plot estimated cases
+weekly_prop_fit %>%
+  ggplot() +
+  geom_area(aes(x = week, y = variant_cases), fill = my_red, col = my_red, alpha = 0.5) +
+  geom_area(aes(x = week, y = cases), fill = "gray50", col = "gray50", alpha = 0.5) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_x_date(date_labels = "%b-%y", date_breaks = "3 months") +
+  facet_wrap(~voc) +
+  labs(
+    x = "Weekly cases",
+    y = "Date"
+  )
+```
+
+```{r}
+## interpolate daily values - linear change within weeks based on difference between consecutive weeks
+
+## calculate difference in values between consecutive weeks
+week_diffs <- weekly_cases %>%
+  mutate(
+    cumul_cases_week = cumsum(cases),
+    cumul_deaths_week = cumsum(deaths),
+    case_diff = round((cumul_cases_week - lag(cumul_cases_week)) / 7),
+    death_diff = round((cumul_deaths_week - lag(cumul_deaths_week)) / 7)
+  )
+
+## create daily time series
+daily_cases <- tibble(
+  date = c(min(week_diffs$week), max(week_diffs$week))
+)
+
+daily_cases <- forecastML::fill_gaps(daily_cases, date_col = 1, frequency = "1 day", static_features = NULL)
+
+daily_cases <- daily_cases %>%
+  mutate(
+    week = lubridate::floor_date(date, unit = "week", week_start = 1)
+  )
+
+daily_cases <- daily_cases %>%
+  left_join(week_diffs, by = "week") %>%
+  mutate(
+    dow = lubridate::wday(date, week_start = 1)
+  )
+
+## daily cumulative cases
+daily_cases <- daily_cases %>%
+  mutate(
+    cumul_cases = cumul_cases_week - ((7 - dow) * case_diff),
+    daily_cases = lead(cumul_cases) - cumul_cases
+  )
+
+## create smoothed daily case series using LOESS
+daily_cases <- daily_cases %>%
+  mutate(
+    smooth_cases = round(stats::predict(stats::loess(daily_cases ~ as.numeric(date), span = 0.1, data=.),
+                         data.frame(date = seq(min(as.numeric(date)), max(as.numeric(date)), 1))))
+  )
+
+
+daily_cases %>%
+  ggplot() +
+  geom_line(aes(x = date, y = daily_cases)) +
+  geom_line(aes(x = date, y = smooth_cases), col = my_red, size = 1)
+```
+```{r}
+## apply weekly variant proportions to daily time series
+daily_prop_fit <- inner_join(
+  weekly_prop_fit %>% select(week, voc, prop, fitted_prop, fitted_prop_lo, fitted_prop_hi),
+  daily_cases %>% select(date, week, smooth_cases),
+  by = "week"
+)
+
+## calculate daily variant cases
+daily_prop_fit <- daily_prop_fit %>%
+  mutate(
+    variant_cases = fitted_prop * smooth_cases,
+    variant_cases_lo = fitted_prop_lo * smooth_cases,
+    variant_cases_hi = fitted_prop_hi * smooth_cases
+  )
+```
+
+```{r, fig.height=9, fig.width=12}
+## plot smoothed daily cases
+daily_prop_fit %>%
+  ggplot() +
+  geom_area(aes(x = date, y = variant_cases), fill = my_red, col = my_red, alpha = 0.5) +
+  geom_area(aes(x = date, y = smooth_cases), fill = "gray50", col = "gray50", alpha = 0.5) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_x_date(date_labels = "%b-%y", date_breaks = "3 months") +
+  facet_wrap(~voc, nrow = 3) +
+  labs(
+    x = "Daily cases",
+    y = "Date"
   )
 ```
 
