@@ -418,7 +418,7 @@ daily_cases %>%
   geom_line(aes(x = date, y = daily_cases)) +
   geom_line(aes(x = date, y = smooth_cases), col = my_red, size = 1)
 ```
-```{r}
+```{r, fig.height=9, fig.width=12}
 ## apply weekly variant proportions to daily time series
 daily_prop_fit <- inner_join(
   weekly_prop_fit %>% select(week, voc, prop, fitted_prop, fitted_prop_lo, fitted_prop_hi),
@@ -426,16 +426,42 @@ daily_prop_fit <- inner_join(
   by = "week"
 )
 
-## calculate daily variant cases
-daily_prop_fit <- daily_prop_fit %>%
-  mutate(
-    variant_cases = fitted_prop * smooth_cases,
-    variant_cases_lo = fitted_prop_lo * smooth_cases,
-    variant_cases_hi = fitted_prop_hi * smooth_cases
+## create smoothed daily variant proportions using LOESS
+# ba1_smooth <- daily_prop_fit %>%
+#   filter(voc == "BA.1") %>%
+#   mutate(
+#     smooth_prop = stats::predict(stats::loess(fitted_prop ~ as.numeric(date), span = 0.2, data=.),
+#                          data.frame(date = seq(min(as.numeric(date)), max(as.numeric(date)), 1)))
+#  )
+
+fits <- daily_prop_fit %>%
+  group_by(voc) %>%
+  group_modify(
+    .f = ~ data.frame(predict(loess(fitted_prop ~ as.numeric(date), span = 0.2, data = .)))
   )
+
+names(fits) <- c("voc", "smooth_prop")
+
+daily_prop_fit <- bind_cols(daily_prop_fit, fits %>% ungroup %>% select(smooth_prop))
+
+daily_prop_fit %>%
+  ggplot() +
+  geom_line(aes(x = date, y = prop)) +
+  geom_line(aes(x = date, y = smooth_prop), col = my_red) + 
+  facet_wrap(~voc)
+
 ```
 
 ```{r, fig.height=9, fig.width=12}
+
+## calculate daily variant cases
+daily_prop_fit <- daily_prop_fit %>%
+  mutate(
+    variant_cases = smooth_prop * smooth_cases,
+    #variant_cases_lo = smooth_prop_lo * smooth_cases,
+    #variant_cases_hi = smooth_prop_hi * smooth_cases
+  )
+
 ## plot smoothed daily cases
 daily_prop_fit %>%
   ggplot() +
@@ -443,10 +469,10 @@ daily_prop_fit %>%
   geom_area(aes(x = date, y = smooth_cases), fill = "gray50", col = "gray50", alpha = 0.5) +
   scale_y_continuous(labels = scales::comma) +
   scale_x_date(date_labels = "%b-%y", date_breaks = "3 months") +
-  facet_wrap(~voc, nrow = 3) +
+  facet_wrap(~voc, nrow = 3, scales = "free_y") +
   labs(
-    x = "Daily cases",
-    y = "Date"
+    y = "Daily cases",
+    x = "Date"
   )
 ```
 
