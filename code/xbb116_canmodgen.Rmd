@@ -457,7 +457,7 @@ daily_prop_fit %>%
 ## calculate daily variant cases
 daily_prop_fit <- daily_prop_fit %>%
   mutate(
-    variant_cases = smooth_prop * smooth_cases,
+    variant_cases = round(smooth_prop * smooth_cases, 0),
     #variant_cases_lo = smooth_prop_lo * smooth_cases,
     #variant_cases_hi = smooth_prop_hi * smooth_cases
   )
@@ -474,5 +474,32 @@ daily_prop_fit %>%
     y = "Daily cases",
     x = "Date"
   )
+```
+
+```{r, fig.height=9, fig.width=12}
+## estimate Re(t) using parametric method
+
+## define mean and SD for serial interval distribution (Gamma distribution)
+#si_mean <- 5.2  # values from Leung et al., Nat Commun 2021; 12: 1501. https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7940469/
+#si_sd <- 0.33
+
+si_mean <- 3.3 # values from https://www.medrxiv.org/content/10.1101/2022.01.08.22268920v1.full.pdf
+si_sd <- 3.5
+
+variant <- "BQ.1.1"
+
+incid <- daily_prop_fit %>%
+  ungroup %>%
+  filter(voc == variant & !is.na(variant_cases)) %>%
+  select("I" = variant_cases, "dates" = date)
+
+res_parametric_si <- estimate_R(incid, 
+                                method="parametric_si",
+                                config = make_config(list(
+                                  mean_si = si_mean, 
+                                  std_si = si_sd))
+)
+
+plot(res_parametric_si)
 ```
 
