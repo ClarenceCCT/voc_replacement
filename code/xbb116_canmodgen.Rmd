@@ -16,12 +16,13 @@ library(tidyverse)
 library(here)
 library(ggrepel)
 library(patchwork)
+library(EpiEstim)
 ```
 
 ```{r}
 ## load data
 rm(list = ls())
-dat <- read_tsv(here("data", "virusseq-metadata-export-2023-04-20T16_09_15.417Z.tsv"))
+dat <- read_tsv(here("data", "virusseq-metadata-export-2023-04-24T20_24_34.009Z.tsv"))
 
 ## create week variable
 dat <- dat %>%
@@ -87,10 +88,10 @@ dat3 %>%
 
 
 ```{r, fig.width = 12, fig.height = 9}
-my_blues <- RColorBrewer::brewer.pal(length(variants), 'Blues')[2:length(variants)]
+my_blues <- RColorBrewer::brewer.pal(length(variants), 'Blues')[3:length(variants)]
 my_red <- "#BF4545"
-my_cols <- c(my_blues, my_red)
-my_sizes <- c(rep(0.5, length(my_blues)), 1)
+my_cols <- c("gray80", my_blues, my_red)
+my_sizes <- c(rep(0.5, length(my_cols)), 1)
 
 ## plot variant counts over time
 p <- dat3 %>%
@@ -106,7 +107,7 @@ p <- dat3 %>%
     y = "Weekly samples collected",
     col = "Lineage",
     size = "Lineage"
-  ) 
+  )
 
 p
 ```
@@ -213,7 +214,7 @@ owid <- read_csv(here("data", "owid-covid-data.csv"))
 
 case_df <- owid %>%
   filter(location == "Canada" & date > as.Date("2021-11-01")) %>%
-  select(location, date, new_cases, new_deaths, weekly_hosp_admissions) 
+  select(location, date, new_cases, new_deaths, hosp_patients, icu_patients) # note hospital and ICU patients are not new admissions 
 
 ## note that only weekly totals are reported from June 2022
 ## aggregate to weekly time series
@@ -225,7 +226,9 @@ weekly_cases <- case_df %>%
   group_by(week) %>%
   summarise(
     cases = sum(new_cases),
-    deaths = sum(new_deaths)
+    deaths = sum(new_deaths),
+    icu_patients = mean(icu_patients),
+    hosp_patients = mean(hosp_patients)
   )
 
 p2 <- weekly_cases %>%
@@ -240,6 +243,37 @@ p2 <- weekly_cases %>%
 
 p2
 ```
+
+
+```{r, fig.height=9, fig.width=12}
+## faceted plot of outcomes
+weekly_cases %>%
+  pivot_longer(-week, names_to = "outcome", values_to = "value") %>%
+  ggplot(aes(x = week, y = value)) +
+  geom_line() +
+  scale_y_continuous(labels = scales::comma) +
+  scale_x_date(date_labels = "%b-%y", date_breaks = "1 month") +
+  facet_wrap(~outcome, scales = "free_y", nrow = 4)
+```
+
+```{r, fig.height = 6, fig.width = 12}
+## smoothed trend
+weekly_cases %>%
+  pivot_longer(-week, names_to = "outcome", values_to = "value") %>%
+  filter(outcome %in% c("cases", "deaths")) %>%
+  ggplot(aes(x = week, y = value)) +
+  geom_line() +
+  geom_smooth(col = my_red) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_x_date(date_labels = "%b-%y", date_breaks = "1 month") +
+  facet_wrap(~outcome, scales = "free_y", nrow = 2) +
+  labs(
+    y = "Weekly deaths / cases",
+    x = "Date"
+  )
+```
+
+
 ```{r, fig.height=6, fig.width=12}
 
 #dat3 <- dat3 %>%
@@ -438,14 +472,32 @@ fits <- daily_prop_fit %>%
   group_by(voc) %>%
   group_modify(
     .f = ~ data.frame(predict(loess(fitted_prop ~ as.numeric(date), span = 0.2, data = .)))
-  )
+  ) %>%
+  ungroup
 
-names(fits) <- c("voc", "smooth_prop")
+fits_lo <- daily_prop_fit %>%
+  group_by(voc) %>%
+  group_modify(
+    .f = ~ data.frame(predict(loess(fitted_prop_lo ~ as.numeric(date), span = 0.2, data = .)))
+  ) %>%
+  ungroup
 
-daily_prop_fit <- bind_cols(daily_prop_fit, fits %>% ungroup %>% select(smooth_prop))
+fits_hi <- daily_prop_fit %>%
+  group_by(voc) %>%
+  group_modify(
+    .f = ~ data.frame(predict(loess(fitted_prop_hi ~ as.numeric(date), span = 0.2, data = .)))
+  ) %>%
+  ungroup
+
+fits <- bind_cols(fits, fits_lo %>% select(-voc), fits_hi %>% select(-voc))
+
+names(fits) <- c("voc", "smooth_prop", "smooth_prop_lo", "smooth_prop_hi")
+
+daily_prop_fit <- bind_cols(daily_prop_fit, fits %>% select(smooth_prop, smooth_prop_lo, smooth_prop_hi))
 
 daily_prop_fit %>%
   ggplot() +
+  geom_ribbon(aes(x = date, ymin = smooth_prop_lo, ymax = smooth_prop_hi), fill = "gray50", alpha = 0.5) +
   geom_line(aes(x = date, y = prop)) +
   geom_line(aes(x = date, y = smooth_prop), col = my_red) + 
   facet_wrap(~voc)
@@ -458,8 +510,8 @@ daily_prop_fit %>%
 daily_prop_fit <- daily_prop_fit %>%
   mutate(
     variant_cases = round(smooth_prop * smooth_cases, 0),
-    #variant_cases_lo = smooth_prop_lo * smooth_cases,
-    #variant_cases_hi = smooth_prop_hi * smooth_cases
+    variant_cases_lo = smooth_prop_lo * smooth_cases,
+    variant_cases_hi = smooth_prop_hi * smooth_cases
   )
 
 ## plot smoothed daily cases
@@ -467,16 +519,16 @@ daily_prop_fit %>%
   ggplot() +
   geom_area(aes(x = date, y = variant_cases), fill = my_red, col = my_red, alpha = 0.5) +
   geom_area(aes(x = date, y = smooth_cases), fill = "gray50", col = "gray50", alpha = 0.5) +
-  scale_y_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) + #, trans = scales::log10_trans()) +
   scale_x_date(date_labels = "%b-%y", date_breaks = "3 months") +
-  facet_wrap(~voc, nrow = 3, scales = "free_y") +
+  facet_wrap(~voc, nrow = 3) + #, scales = "free_y") +
   labs(
     y = "Daily cases",
     x = "Date"
   )
 ```
 
-```{r, fig.height=9, fig.width=12}
+```{r, fig.height=6, fig.width=12}
 ## estimate Re(t) using parametric method
 
 ## define mean and SD for serial interval distribution (Gamma distribution)
@@ -486,7 +538,7 @@ daily_prop_fit %>%
 si_mean <- 3.3 # values from https://www.medrxiv.org/content/10.1101/2022.01.08.22268920v1.full.pdf
 si_sd <- 3.5
 
-variant <- "BQ.1.1"
+variant <- "XBB.1.16"
 
 incid <- daily_prop_fit %>%
   ungroup %>%
@@ -500,6 +552,201 @@ res_parametric_si <- estimate_R(incid,
                                   std_si = si_sd))
 )
 
-plot(res_parametric_si)
+## align epidemic curve and Re(t) estimates for plotting
+d <- incid %>%
+  mutate(
+    day = row_number()
+  ) %>%
+  left_join(
+    res_parametric_si$R, by = c("day" = "t_end")
+  )
+
+## convert to long format for faceting
+d <- bind_rows(
+  d %>% select(day, "date" = dates, "value" = I) %>% mutate(type = "incidence"),
+  d %>% select(day, "date" = dates, "value" = `Median(R)`, starts_with("Quantile")) %>% mutate(type = "Re(t)")
+)
+
+#plot(res_parametric_si)
+
+d %>%
+  ggplot() +
+  geom_ribbon(aes(x = date, ymin = `Quantile.0.025(R)`, ymax = `Quantile.0.975(R)`), fill = "gray80", alpha = 0.5) +
+  geom_ribbon(aes(x = date, ymin = `Quantile.0.25(R)`, ymax = `Quantile.0.75(R)`), fill = "gray50", alpha = 0.5) +
+  geom_line(aes(x = date, y = value, group = type)) +
+  facet_wrap(~type, nrow = 2, scales = "free_y") +
+  scale_x_date(date_labels = "%d-%b-%y", date_breaks = "2 weeks") +
+  labs(
+    y = "Daily cases / Re(t)",
+    x = "Date"
+  )
+  
+```
+
+```{r}
+## function to generate Re(t) estimates for each variant
+
+get_r <- function(x) {
+  
+  incid <- daily_prop_fit %>% ungroup %>% filter(voc == x & !is.na(variant_cases)) %>% select("dates" = date, "I" = variant_cases)
+  
+  results <- estimate_R(incid, method="parametric_si", config = make_config(
+    list(
+      mean_si = si_mean, std_si = si_sd
+      )
+    )
+    ) 
+  
+  results
+  
+}
+
+## get Re(t) estimates
+r_estimates <- map(variants, get_r)
+
+daily_prop_fit %>%
+  select(voc, "dates" = date, "I" = variant_cases) %>%
+  group_by(voc) %>%
+  map(estimate_R(. %>% select(dates, I), method = "parametric_si", config = make_config(list(mean_si = si_mean, std_si = si_sd))))
+  mutate(
+    r_estimates = map(., get_r)
+    )
+
+## extract results to dataframe  
+retrieve_r <- function(l, v) {
+  
+  d <- l$R
+  d <- d %>% mutate(voc = v)
+  d
+  
+} 
+
+r_df <- map2_df(r_estimates, variants, retrieve_r)
+
+## align epidemic curve and Re(t) estimates for plotting
+r_df_long <- daily_prop_fit %>%
+  group_by(voc) %>%
+  select(week, voc, date, variant_cases, variant_cases_lo, variant_cases_hi) %>%
+  mutate(
+    t_end = row_number()
+  ) %>%
+  left_join(r_df, by = c("voc", "t_end"))
+
+## convert to long format for faceting
+r_df_long <- bind_rows(
+  r_df_long %>% select(voc, t_end, date, "value" = variant_cases, variant_cases_lo, variant_cases_hi) %>% mutate(type = "incidence"),
+  r_df_long %>% select(voc, t_end, date, "value" = `Median(R)`, starts_with("Quantile")) %>% mutate(type = "Re(t)")
+)
+  
+## create factor variable for variants
+r_df_long <- r_df_long %>%
+  mutate(
+    voc = factor(voc, levels = variants, labels = variants),
+    yintercept = if_else(type == "Re(t)", 1, NA_real_)
+  )
+```
+
+```{r, fig.height = 9, fig.width=16}
+## plot incidence and Re(t) by variant
+r_plots <- r_df_long %>%
+  group_by(voc) %>%
+  group_map(~ ggplot(.) +
+  geom_ribbon(aes(x = date, ymin = `Quantile.0.025(R)`, ymax = `Quantile.0.975(R)`), fill = "gray80", alpha = 0.5) +
+  geom_ribbon(aes(x = date, ymin = `Quantile.0.25(R)`, ymax = `Quantile.0.75(R)`), fill = "gray50", alpha = 0.5) +
+  geom_ribbon(aes(x = date, ymin = variant_cases_lo, ymax = variant_cases_hi), fill = "gray80", alpha = 0.5) +
+  geom_line(aes(x = date, y = value, group = type)) +
+  geom_line(aes(x = date, y = yintercept), col = "gray50", linetype = "dashed") +
+  facet_wrap(~type, nrow = 2, scales = "free_y") +
+  scale_x_date(date_labels = "%d-%b-%y", date_breaks = "1 month") +
+  ggtitle(.y[[1]]) +
+  labs(
+    y = "Daily cases / Re(t)",
+    x = "Date"
+  ))
+
+require(patchwork)
+
+p <- wrap_plots(r_plots)
+
+ggsave(filename = here("plots", "voc_Restimates_plot.png"), plot = p, device = "png", width = 16, height = 9, dpi = 300)
+
+```
+```{r, fig.height=12, fig.width = 12}
+## plot Re(t) values across variants
+p1 <- r_df_long %>%
+  filter(type == "Re(t)" & voc %in% variants[2:9] &  t_end >= 8 & t_end <= 56) %>%
+  ggplot() +
+  geom_ribbon(aes(x = t_end, ymin = `Quantile.0.25(R)`, ymax = `Quantile.0.75(R)`), fill = "gray50", alpha = 0.5) +
+  geom_ribbon(aes(x = t_end, ymin = `Quantile.0.025(R)`, ymax = `Quantile.0.975(R)`), fill = "gray80", alpha = 0.5) +
+  geom_line(aes(x = t_end, y = value), col = my_red, size = 1) +
+  geom_line(aes(x = t_end, y = yintercept), col = "gray50", linetype = "dashed") +
+  facet_wrap(~voc, ncol = 1) +
+  scale_x_continuous(limits = c(1, 56), breaks = seq(1, 57, 7)) +
+  labs(
+    y = "Re(t)",
+    x = ""
+  )
+
+## plot incidence across variants
+p2 <- r_df_long %>%
+  filter(type == "incidence" & voc %in% variants[2:9] &  t_end >= 8 & t_end <= 56) %>%
+  ggplot() +
+  geom_ribbon(aes(x = t_end, ymin = variant_cases_lo, ymax = variant_cases_hi), fill = "gray80", alpha = 0.5) +
+  geom_line(aes(x = t_end, y = value), col = "gray50", size = 1) +
+  #geom_line(aes(x = t_end, y = yintercept), col = "gray50", linetype = "dashed") +
+  facet_wrap(~voc, ncol = 1, scales = "free_y") +
+  scale_x_continuous(limits = c(1, 56), breaks = seq(1, 57, 7)) +
+  labs(
+    y = "Daily cases",
+    x = ""
+  )
+
+## plot maximum variant proportion across variants
+p3 <- daily_prop_fit %>%
+  group_by(voc, week) %>%
+  summarise(prop = mean(prop)) %>%
+  mutate(
+    t = row_number() * 7
+  ) %>%
+  filter(voc %in% variants[2:9]) %>%
+  ggplot() +
+      geom_rect(aes(xmin = 1, xmax = 56, ymin = 0, ymax = 0.8), fill = my_red, alpha = 0.005) +
+  #geom_ribbon(aes(x = t, ymin = smooth_prop_lo, ymax = smooth_prop_hi), fill = "gray80", alpha = 0.5) +
+  geom_line(aes(x = t, y = prop), col = "black") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", col = "gray50") +
+  geom_vline(xintercept = 56, linetype = "dashed", col = my_red) +
+  facet_wrap(~voc, ncol = 1) +
+  scale_y_continuous(limits = c(0, 0.8), breaks = seq(0, 0.8, 0.2)) +
+  #scale_x_continuous(limits = c(1, 56), breaks = seq(1, 57, 7)) +
+  labs(
+    y = "Variant proportion",
+    x = ""
+  )
+
+p3
+
+```
+```{r, fig.height = 12, fig.width=12}
+## plot Re(t) and incidence
+p1 + p2 +
+  labs(
+    x = "Days since introduction"
+  )
+```
+
+```{r, fig.height = 12, fig.width=12}
+## plot Re(t) and maximum variant proportion
+p1 + p3 +
+  labs(
+    x = "Days since introduction"
+  )
+```
+```{r, fig.width = 18, fig.height = 12}
+p1 + p2 + p3 +
+  labs(
+    x = "Days since introduction"
+  )  
+
+ggsave(here("plots", "voc_R_inc_prop.png"), device = "png", width = 18, height = 12, dpi = 300)
 ```
 
