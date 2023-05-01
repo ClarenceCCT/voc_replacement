@@ -1,0 +1,145 @@
+---
+title: "Variant forecasting using EpiNow2"
+output: 
+  html_notebook:
+    code_folding: hide
+---
+
+```{r}
+library(here)
+library(tidyverse)
+library(covidregionaldata)
+library(EpiEstim)
+library(EpiNow2)
+library(patchwork)
+library(httr)
+library(jsonlite)
+
+source(here("code/colours", "KTD_colours.R"))
+```
+
+```{r}
+## download case data through opencovid.ca API
+res <- GET("https://api.opencovid.ca/timeseries", query = list(
+  stat = "all", geo = "can", before = "2023-04-23", fmt = "json"
+))
+
+json_data <- fromJSON(rawToChar(res$content))
+dat <- bind_rows(data$data)
+case_data <- dat %>%
+  filter(name == "cases")
+
+## load variant data downloaded from CoV-Spectrum
+voc_data <- read_csv(here("data", "VariantTimeDistributionPlot.xbb.1.9.1.csv"))
+
+## create week variable
+voc_data <- voc_data %>%
+  mutate(
+    date = as.Date(date),
+    week = lubridate::floor_date(date, unit = "week", week_start = 1),
+    epiweek = lubridate::epiweek(date)
+  )
+
+case_data <- case_data %>%
+  mutate(
+    date = as.Date(date),
+    week = lubridate::floor_date(date, unit = "week", week_start = 1),
+    epiweek = lubridate::epiweek(date),
+    cases_ma7 = zoo::rollmean(value_daily, k = 7, align = "right", fill = NA) # 7-day moving average
+  )
+
+## merge case and variant data from date of first detection
+min_date <- voc_data %>%
+  filter(proportion > 0) %>%
+  summarise(min(date)) %>%
+  pull()
+
+dat2 <- left_join(
+  voc_data %>% select(date, starts_with("proportion")), 
+  case_data %>% select(date, "cases" = value_daily, "cases_smooth" = cases_ma7),
+  by = "date"
+  ) %>% 
+  filter(date >= min_date) %>%
+  mutate(
+    voc_cases = round(cases_smooth * proportion),
+    voc_cases_lo = cases_smooth * proportionCILow,
+    voc_cases_hi = cases_smooth * proportionCIHigh
+  )
+``gggggggggggg`
+
+```{r}
+## plot case and variant data
+dat <- bind_rows(
+  case_data %>% select(date, "value" = value_daily, cases_ma7) %>% mutate(type = "cases"),
+  voc_data %>% select(date, "value" = proportion, "prop_lo" = proportionCILow, "prop_hi" = proportionCIHigh) %>% mutate(type = "sequences")
+)
+
+dat %>%
+  filter(date >= as.Date("2023-03-01")) %>%
+  ggplot() + 
+  geom_line(aes(x = date, y = value)) +
+  geom_line(aes(x = date, y = cases_ma7), col = my_red) +
+  geom_ribbon(aes(x = date, ymin = prop_lo, ymax = prop_hi), alpha = 0.5) +
+  facet_wrap(~type, nrow = 2, scales = "free_y")
+  
+```
+
+```{r}
+## plot overall vs estimated variant cases
+dat2 %>%
+  ggplot() +
+  geom_area(aes(x = date, y = cases_smooth), fill = "gray50", alpha = 0.5) +
+  geom_area(aes(x = date, y = voc_cases), fill = my_red, alpha = 0.5)
+```
+```{r}
+## estimate Re(t) using parametric method
+
+## define mean and SD for serial interval distribution (Gamma distribution)
+#si_mean <- 5.2  # values from Leung et al., Nat Commun 2021; 12: 1501. https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7940469/
+#si_sd <- 0.33
+
+si_mean <- 3.3 # values from https://www.medrxiv.org/content/10.1101/2022.01.08.22268920v1.full.pdf
+si_sd <- 3.5
+
+#variant <- "XBB.1.16"
+
+incid <- dat2 %>%
+  select("I" = voc_cases, "dates" = date)
+
+res_parametric_si <- estimate_R(incid, 
+                                method="parametric_si",
+                                config = make_config(list(
+                                  mean_si = si_mean, 
+                                  std_si = si_sd))
+)
+
+## align epidemic curve and Re(t) estimates for plotting
+d <- incid %>%
+  mutate(
+    day = row_number()
+  ) %>%
+  left_join(
+    res_parametric_si$R, by = c("day" = "t_end")
+  )
+
+## convert to long format for faceting
+d <- bind_rows(
+  d %>% select(day, "date" = dates, "value" = I) %>% mutate(type = "incidence"),
+  d %>% select(day, "date" = dates, "value" = `Median(R)`, starts_with("Quantile")) %>% mutate(type = "Re(t)")
+)
+
+#plot(res_parametric_si)
+
+d %>%
+  ggplot() +
+  geom_ribbon(aes(x = date, ymin = `Quantile.0.025(R)`, ymax = `Quantile.0.975(R)`), fill = "gray80", alpha = 0.5) +
+  geom_ribbon(aes(x = date, ymin = `Quantile.0.25(R)`, ymax = `Quantile.0.75(R)`), fill = "gray50", alpha = 0.5) +
+  geom_line(aes(x = date, y = value, group = type)) +
+  facet_wrap(~type, nrow = 2, scales = "free_y") +
+  scale_x_date(date_labels = "%d-%b-%y", date_breaks = "2 weeks") +
+  labs(
+    y = "Daily cases / Re(t)",
+    x = "Date"
+  )
+```
+
