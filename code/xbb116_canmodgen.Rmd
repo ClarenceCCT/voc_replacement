@@ -1,6 +1,8 @@
 ---
 title: "XBB.1.16 analysis"
-output: 
+output:
+  html_document:
+    df_print: paged
   html_notebook:
     code_folding: hide
 ---
@@ -215,7 +217,6 @@ owid <- read_csv(here("data", "owid-covid-data.csv"))
 case_df <- owid %>%
   filter(location == "Canada" & date > as.Date("2021-11-01")) %>%
   select(location, date, new_cases, new_deaths, hosp_patients, icu_patients) # note hospital and ICU patients are not new admissions 
-
 ## note that only weekly totals are reported from June 2022
 ## aggregate to weekly time series
 
